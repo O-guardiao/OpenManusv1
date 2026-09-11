@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from app.llm import LLM
 from app.logger import logger
@@ -39,6 +39,7 @@ class BaseAgent(BaseModel, ABC):
     # Execution control
     max_steps: int = Field(default=10, description="Maximum steps before termination")
     current_step: int = Field(default=0, description="Current step in execution")
+    _step_limit_reached: bool = PrivateAttr(default=False)
 
     duplicate_threshold: int = 2
 
@@ -132,25 +133,29 @@ class BaseAgent(BaseModel, ABC):
             self.update_memory("user", request)
 
         results: List[str] = []
-        async with self.state_context(AgentState.RUNNING):
-            while (
-                self.current_step < self.max_steps and self.state != AgentState.FINISHED
-            ):
-                self.current_step += 1
-                logger.info(f"Executing step {self.current_step}/{self.max_steps}")
-                step_result = await self.step()
+        self.current_step = 0
+        self._step_limit_reached = False
+        try:
+            async with self.state_context(AgentState.RUNNING):
+                while (
+                    self.current_step < self.max_steps
+                    and self.state != AgentState.FINISHED
+                ):
+                    self.current_step += 1
+                    logger.info(f"Executing step {self.current_step}/{self.max_steps}")
+                    step_result = await self.step()
 
-                # Check for stuck state
-                if self.is_stuck():
-                    self.handle_stuck_state()
+                    # Check for stuck state
+                    if self.is_stuck():
+                        self.handle_stuck_state()
 
-                results.append(f"Step {self.current_step}: {step_result}")
+                    results.append(f"Step {self.current_step}: {step_result}")
 
-            if self.current_step >= self.max_steps:
-                self.current_step = 0
-                self.state = AgentState.IDLE
-                results.append(f"Terminated: Reached max steps ({self.max_steps})")
-        await SANDBOX_CLIENT.cleanup()
+                if self.current_step >= self.max_steps and self.state != AgentState.FINISHED:
+                    self._step_limit_reached = True
+                    results.append(f"Terminated: Reached max steps ({self.max_steps})")
+        finally:
+            await SANDBOX_CLIENT.cleanup()
         return "\n".join(results) if results else "No steps executed"
 
     @abstractmethod

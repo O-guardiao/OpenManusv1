@@ -1,3 +1,4 @@
+import hashlib
 import time
 
 from daytona import (
@@ -12,6 +13,10 @@ from daytona import (
 
 from app.config import config
 from app.utils.logger import logger
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 # load_dotenv()
@@ -29,7 +34,7 @@ else:
     logger.warning("No Daytona API key found in environment variables")
 
 if daytona_config.server_url:
-    logger.info(f"Daytona server URL set to: {daytona_config.server_url}")
+    logger.info("Daytona server URL configured")
 else:
     logger.warning("No Daytona server URL found in environment variables")
 
@@ -45,7 +50,8 @@ logger.info("Daytona client initialized")
 async def get_or_start_sandbox(sandbox_id: str):
     """Retrieve a sandbox by ID, check its state, and start it if needed."""
 
-    logger.info(f"Getting or starting sandbox with ID: {sandbox_id}")
+    sandbox_id_sha256 = _digest(sandbox_id)
+    logger.info(f"Getting or starting sandbox ({sandbox_id_sha256})")
 
     try:
         sandbox = daytona.get(sandbox_id)
@@ -66,15 +72,15 @@ async def get_or_start_sandbox(sandbox_id: str):
                 # Start supervisord in a session when restarting
                 start_supervisord_session(sandbox)
             except Exception as e:
-                logger.error(f"Error starting sandbox: {e}")
-                raise e
+                logger.error(f"Sandbox start failed with {type(e).__name__}")
+                raise
 
-        logger.info(f"Sandbox {sandbox_id} is ready")
+        logger.info(f"Sandbox is ready ({sandbox_id_sha256})")
         return sandbox
 
     except Exception as e:
-        logger.error(f"Error retrieving or starting sandbox: {str(e)}")
-        raise e
+        logger.error(f"Sandbox retrieval failed with {type(e).__name__}")
+        raise
 
 
 def start_supervisord_session(sandbox: Sandbox):
@@ -94,9 +100,12 @@ def start_supervisord_session(sandbox: Sandbox):
         )
         time.sleep(25)  # Wait a bit to ensure supervisord starts properly
         logger.info(f"Supervisord started in session {session_id}")
-    except Exception as e:
-        logger.error(f"Error starting supervisord session: {str(e)}")
-        raise e
+    except Exception as error:
+        logger.error(
+            "Supervisord session failed with "
+            f"{type(error).__name__}"
+        )
+        raise
 
 
 def create_sandbox(password: str, project_id: str = None):
@@ -107,7 +116,7 @@ def create_sandbox(password: str, project_id: str = None):
 
     labels = None
     if project_id:
-        logger.info(f"Using sandbox_id as label: {project_id}")
+        logger.info(f"Using sandbox label ({_digest(project_id)})")
         labels = {"id": project_id}
 
     params = CreateSandboxFromImageParams(
@@ -138,7 +147,7 @@ def create_sandbox(password: str, project_id: str = None):
 
     # Create the sandbox
     sandbox = daytona.create(params)
-    logger.info(f"Sandbox created with ID: {sandbox.id}")
+    logger.info(f"Sandbox created ({_digest(str(sandbox.id))})")
 
     # Start supervisord in a session for new sandbox
     start_supervisord_session(sandbox)
@@ -149,7 +158,8 @@ def create_sandbox(password: str, project_id: str = None):
 
 async def delete_sandbox(sandbox_id: str):
     """Delete a sandbox by its ID."""
-    logger.info(f"Deleting sandbox with ID: {sandbox_id}")
+    sandbox_id_sha256 = _digest(sandbox_id)
+    logger.info(f"Deleting sandbox ({sandbox_id_sha256})")
 
     try:
         # Get the sandbox
@@ -158,8 +168,8 @@ async def delete_sandbox(sandbox_id: str):
         # Delete the sandbox
         daytona.delete(sandbox)
 
-        logger.info(f"Successfully deleted sandbox {sandbox_id}")
+        logger.info(f"Successfully deleted sandbox ({sandbox_id_sha256})")
         return True
     except Exception as e:
-        logger.error(f"Error deleting sandbox {sandbox_id}: {str(e)}")
-        raise e
+        logger.error(f"Sandbox deletion failed with {type(e).__name__}")
+        raise

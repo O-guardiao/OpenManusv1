@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Callable, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class Role(str, Enum):
@@ -51,6 +51,25 @@ class ToolCall(BaseModel):
     function: Function
 
 
+class MessageProvenance(BaseModel):
+    """Origin and trust metadata kept beside model-visible content.
+
+    The metadata is intentionally omitted from the provider payload.  The
+    equivalent trust boundary is rendered into ``content`` so providers that do
+    not support provenance fields still receive it, while the structured form
+    remains available to the local controller and audit code.
+    """
+
+    source: str
+    source_kind: str
+    trust_tier: str
+    carrier_type: str
+    content_sha256: str
+    normalized_sha256: str
+    taint_ids: List[str] = Field(default_factory=list)
+    transformations: List[str] = Field(default_factory=list)
+
+
 class Message(BaseModel):
     """Represents a chat message in the conversation"""
 
@@ -60,6 +79,7 @@ class Message(BaseModel):
     name: Optional[str] = Field(default=None)
     tool_call_id: Optional[str] = Field(default=None)
     base64_image: Optional[str] = Field(default=None)
+    provenance: Optional[MessageProvenance] = Field(default=None, exclude=True)
 
     def __add__(self, other) -> List["Message"]:
         """支持 Message + list 或 Message + Message 的操作"""
@@ -98,10 +118,18 @@ class Message(BaseModel):
 
     @classmethod
     def user_message(
-        cls, content: str, base64_image: Optional[str] = None
+        cls,
+        content: str,
+        base64_image: Optional[str] = None,
+        provenance: Optional[MessageProvenance] = None,
     ) -> "Message":
         """Create a user message"""
-        return cls(role=Role.USER, content=content, base64_image=base64_image)
+        return cls(
+            role=Role.USER,
+            content=content,
+            base64_image=base64_image,
+            provenance=provenance,
+        )
 
     @classmethod
     def system_message(cls, content: str) -> "Message":
@@ -117,7 +145,12 @@ class Message(BaseModel):
 
     @classmethod
     def tool_message(
-        cls, content: str, name, tool_call_id: str, base64_image: Optional[str] = None
+        cls,
+        content: str,
+        name,
+        tool_call_id: str,
+        base64_image: Optional[str] = None,
+        provenance: Optional[MessageProvenance] = None,
     ) -> "Message":
         """Create a tool message"""
         return cls(
@@ -126,6 +159,7 @@ class Message(BaseModel):
             name=name,
             tool_call_id=tool_call_id,
             base64_image=base64_image,
+            provenance=provenance,
         )
 
     @classmethod
@@ -157,22 +191,26 @@ class Message(BaseModel):
 
 
 class Memory(BaseModel):
+    """Complete transcript; context limits are applied to a separate selection."""
+
     messages: List[Message] = Field(default_factory=list)
     max_messages: int = Field(default=100)
+    _listener: Optional[Callable[[Message], None]] = PrivateAttr(default=None)
+
+    def set_listener(self, callback: Optional[Callable[[Message], None]]) -> None:
+        """Install a synchronous persistence callback, invoked before append."""
+        self._listener = callback
 
     def add_message(self, message: Message) -> None:
         """Add a message to memory"""
+        if self._listener is not None:
+            self._listener(message)
         self.messages.append(message)
-        # Optional: Implement message limit
-        if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages :]
 
     def add_messages(self, messages: List[Message]) -> None:
         """Add multiple messages to memory"""
-        self.messages.extend(messages)
-        # Optional: Implement message limit
-        if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages :]
+        for message in messages:
+            self.add_message(message)
 
     def clear(self) -> None:
         """Clear all messages"""

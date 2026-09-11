@@ -4,6 +4,7 @@ from datetime import datetime
 from loguru import logger as _logger
 
 from app.config import PROJECT_ROOT
+from app.harness.redaction import redact_loguru_record
 
 
 _print_level = "INFO"
@@ -21,8 +22,12 @@ def define_log_level(print_level="INFO", logfile_level="DEBUG", name: str = None
     )  # name a log with prefix name
 
     _logger.remove()
-    _logger.add(sys.stderr, level=print_level)
-    _logger.add(PROJECT_ROOT / f"logs/{log_name}.log", level=logfile_level)
+    _logger.configure(patcher=redact_loguru_record)
+    _logger.add(sys.stderr, level=print_level, diagnose=False, backtrace=False)
+    _logger.add(
+        PROJECT_ROOT / f"logs/{log_name}.log", level=logfile_level,
+        diagnose=False, backtrace=False,
+    )
     return _logger
 
 

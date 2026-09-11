@@ -7,6 +7,22 @@ from pydantic import BaseModel, Field
 from app.utils.logger import logger
 
 
+def tool_result_failed(result: Any) -> bool:
+    """Recognize explicit failure signals in the legacy adapter contracts.
+
+    A failed return cannot prove that an external effect did not happen. The
+    dispatcher records an unknown effect, keeping recovery conservative.
+    Plain text is not parsed as an execution status.
+    """
+    if isinstance(result, dict):
+        return bool(
+            ('success' in result and result['success'] is not True)
+            or result.get('error') or result.get('isError')
+            or result.get('exit_code', 0) not in (None, 0)
+        )
+    return bool(getattr(result, 'error', None))
+
+
 # class BaseTool(ABC, BaseModel):
 #     name: str
 #     description: str

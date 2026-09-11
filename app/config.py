@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import tomllib
 from pathlib import Path
@@ -106,7 +107,9 @@ class SandboxSettings(BaseModel):
 
 
 class DaytonaSettings(BaseModel):
-    daytona_api_key: str
+    daytona_api_key: str = Field(
+        "", description="Optional Daytona API key; required only when Daytona is used"
+    )
     daytona_server_url: Optional[str] = Field(
         "https://app.daytona.io/api", description=""
     )
@@ -120,7 +123,7 @@ class DaytonaSettings(BaseModel):
     #     None, description="ID of the daytona sandbox to use, if any"
     # )
     VNC_password: Optional[str] = Field(
-        "123456", description="VNC password for the vnc service in sandbox"
+        None, description="VNC password; required explicitly when Daytona is used"
     )
 
 
@@ -216,6 +219,12 @@ class Config:
 
     @staticmethod
     def _get_config_path() -> Path:
+        override = os.environ.get("OPENMANUS_CONFIG")
+        if override is not None:
+            explicit_path = Path(override).expanduser().resolve()
+            if not override.strip() or not explicit_path.is_file():
+                raise FileNotFoundError("OPENMANUS_CONFIG must name an existing file")
+            return explicit_path
         root = PROJECT_ROOT
         config_path = root / "config" / "config.toml"
         if config_path.exists():

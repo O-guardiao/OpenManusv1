@@ -22,4 +22,6 @@ class Terminate(BaseTool):
 
     async def execute(self, status: str) -> str:
         """Finish the current execution"""
+        if status not in {'success', 'failure'}:
+            raise ValueError('Termination status must be success or failure')
         return f"The interaction has been completed with status: {status}"

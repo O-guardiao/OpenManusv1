@@ -1,4 +1,5 @@
 import math
+from copy import deepcopy
 from typing import Dict, List, Optional, Union
 
 import tiktoken
@@ -10,10 +11,10 @@ from openai import (
     OpenAIError,
     RateLimitError,
 )
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat import ChatCompletionMessage
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
@@ -21,6 +22,12 @@ from tenacity import (
 from app.bedrock import BedrockClient
 from app.config import LLMSettings, config
 from app.exceptions import TokenLimitExceeded
+from app.harness.provider import (
+    EventCallback,
+    is_transient_provider_error,
+    print_text_event,
+    request_message,
+)
 from app.logger import logger  # Assuming a logger is set up in your app
 from app.schema import (
     ROLE_VALUES,
@@ -40,6 +47,35 @@ MULTIMODAL_MODELS = [
     "claude-3-sonnet-20240229",
     "claude-3-haiku-20240307",
 ]
+
+
+class ConservativeByteTokenizer:
+    """Offline fallback that overestimates tokens as UTF-8 bytes.
+
+    It preserves safety for input limits when tiktoken has no cached vocabulary.
+    Counts are deliberately approximate and must not be reported as provider
+    billing usage.
+    """
+
+    def encode(self, text: str) -> list[int]:
+        return list(text.encode("utf-8"))
+
+
+def load_tokenizer(model: str):
+    """Resolve a tokenizer without making startup depend on network access."""
+
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception as primary_error:
+        try:
+            return tiktoken.get_encoding("cl100k_base")
+        except Exception as fallback_error:
+            logger.warning(
+                "Tokenizer vocabulary unavailable; using conservative offline "
+                f"byte counts ({type(primary_error).__name__}/"
+                f"{type(fallback_error).__name__})."
+            )
+            return ConservativeByteTokenizer()
 
 
 class TokenCounter:
@@ -200,29 +236,29 @@ class LLM:
             # Add token counting related attributes
             self.total_input_tokens = 0
             self.total_completion_tokens = 0
+            self.unreported_input_tokens = 0
+            self.last_usage = None
             self.max_input_tokens = (
                 llm_config.max_input_tokens
                 if hasattr(llm_config, "max_input_tokens")
                 else None
             )
 
-            # Initialize tokenizer
-            try:
-                self.tokenizer = tiktoken.encoding_for_model(self.model)
-            except KeyError:
-                # If the model is not in tiktoken's presets, use cl100k_base as default
-                self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            self.tokenizer = load_tokenizer(self.model)
 
             if self.api_type == "azure":
                 self.client = AsyncAzureOpenAI(
                     base_url=self.base_url,
                     api_key=self.api_key,
                     api_version=self.api_version,
+                    max_retries=0,
                 )
             elif self.api_type == "aws":
                 self.client = BedrockClient()
             else:
-                self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+                self.client = AsyncOpenAI(
+                    api_key=self.api_key, base_url=self.base_url, max_retries=0
+                )
 
             self.token_counter = TokenCounter(self.tokenizer)
 
@@ -249,7 +285,10 @@ class LLM:
     def check_token_limit(self, input_tokens: int) -> bool:
         """Check if token limits are exceeded"""
         if self.max_input_tokens is not None:
-            return (self.total_input_tokens + input_tokens) <= self.max_input_tokens
+            return (
+                self.total_input_tokens + getattr(self, "unreported_input_tokens", 0)
+                + input_tokens
+            ) <= self.max_input_tokens
         # If max_input_tokens is not set, always return True
         return True
 
@@ -257,9 +296,13 @@ class LLM:
         """Generate error message for token limit exceeded"""
         if (
             self.max_input_tokens is not None
-            and (self.total_input_tokens + input_tokens) > self.max_input_tokens
+            and not self.check_token_limit(input_tokens)
         ):
-            return f"Request may exceed input token limit (Current: {self.total_input_tokens}, Needed: {input_tokens}, Max: {self.max_input_tokens})"
+            return (
+                f"Request may exceed input token limit (Reported: {self.total_input_tokens}, "
+                f"Unreported estimate: {getattr(self, 'unreported_input_tokens', 0)}, "
+                f"Needed: {input_tokens}, Max: {self.max_input_tokens})"
+            )
 
         return "Token limit exceeded"
 
@@ -297,6 +340,7 @@ class LLM:
                 message = message.to_dict()
 
             if isinstance(message, dict):
+                message = deepcopy(message)  # Retries must not append images repeatedly.
                 # If message is a dict, ensure it has required fields
                 if "role" not in message:
                     raise ValueError("Message dict must contain 'role' field")
@@ -354,9 +398,8 @@ class LLM:
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        retry=retry_if_exception(is_transient_provider_error),
+        reraise=True,
     )
     async def ask(
         self,
@@ -416,48 +459,18 @@ class LLM:
                     temperature if temperature is not None else self.temperature
                 )
 
-            if not stream:
-                # Non-streaming request
-                response = await self.client.chat.completions.create(
-                    **params, stream=False
-                )
-
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
-
-                # Update token counts
-                self.update_token_count(
-                    response.usage.prompt_tokens, response.usage.completion_tokens
-                )
-
-                return response.choices[0].message.content
-
-            # Streaming request, For streaming, update estimated token count before making the request
-            self.update_token_count(input_tokens)
-
-            response = await self.client.chat.completions.create(**params, stream=True)
-
-            collected_messages = []
-            completion_text = ""
-            async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
-                collected_messages.append(chunk_message)
-                completion_text += chunk_message
-                print(chunk_message, end="", flush=True)
-
-            print()  # Newline after streaming
-            full_response = "".join(collected_messages).strip()
-            if not full_response:
-                raise ValueError("Empty response from streaming LLM")
-
-            # estimate completion tokens for streaming response
-            completion_tokens = self.count_tokens(completion_text)
-            logger.info(
-                f"Estimated completion tokens for streaming response: {completion_tokens}"
+            params["stream"] = stream
+            if stream and self.api_type != "aws":
+                params["stream_options"] = {"include_usage": True}
+            response = await request_message(
+                self, params, input_tokens,
+                on_event=print_text_event if stream else None,
             )
-            self.total_completion_tokens += completion_tokens
-
-            return full_response
+            if stream:
+                print()
+            if not response.content:
+                raise ValueError("Empty text response from LLM")
+            return response.content.strip() if stream else response.content
 
         except TokenLimitExceeded:
             # Re-raise token limit errors without logging
@@ -481,9 +494,8 @@ class LLM:
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        retry=retry_if_exception(is_transient_provider_error),
+        reraise=True,
     )
     async def ask_with_images(
         self,
@@ -588,33 +600,17 @@ class LLM:
                     temperature if temperature is not None else self.temperature
                 )
 
-            # Handle non-streaming request
-            if not stream:
-                response = await self.client.chat.completions.create(**params)
-
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
-
-                self.update_token_count(response.usage.prompt_tokens)
-                return response.choices[0].message.content
-
-            # Handle streaming request
-            self.update_token_count(input_tokens)
-            response = await self.client.chat.completions.create(**params)
-
-            collected_messages = []
-            async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
-                collected_messages.append(chunk_message)
-                print(chunk_message, end="", flush=True)
-
-            print()  # Newline after streaming
-            full_response = "".join(collected_messages).strip()
-
-            if not full_response:
-                raise ValueError("Empty response from streaming LLM")
-
-            return full_response
+            if stream and self.api_type != "aws":
+                params["stream_options"] = {"include_usage": True}
+            response = await request_message(
+                self, params, input_tokens,
+                on_event=print_text_event if stream else None,
+            )
+            if stream:
+                print()
+            if not response.content:
+                raise ValueError("Empty text response from LLM")
+            return response.content.strip() if stream else response.content
 
         except TokenLimitExceeded:
             raise
@@ -637,9 +633,8 @@ class LLM:
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        retry=retry_if_exception(is_transient_provider_error),
+        reraise=True,
     )
     async def ask_tool(
         self,
@@ -649,6 +644,8 @@ class LLM:
         tools: Optional[List[dict]] = None,
         tool_choice: TOOL_CHOICE_TYPE = ToolChoice.AUTO,  # type: ignore
         temperature: Optional[float] = None,
+        stream: bool = False,
+        on_event: Optional[EventCallback] = None,
         **kwargs,
     ) -> ChatCompletionMessage | None:
         """
@@ -661,6 +658,13 @@ class LLM:
             tools: List of tools to use
             tool_choice: Tool choice strategy
             temperature: Sampling temperature for the response
+            stream: Opt-in OpenAI/Azure tool streaming; Bedrock is unsupported.
+            on_event: Awaited callback receiving {type: model_text_delta, text: str}.
+                Only complete, valid tool-call envelopes/JSON are returned. Tool
+                parameter schemas are validated by the dispatcher. Failed streams
+                after visible output raise stream_interrupted without replay.
+                last_usage reports missing provider usage explicitly, with input
+                estimates kept separate from provider-reported cumulative totals.
             **kwargs: Additional completion arguments
 
         Returns:
@@ -673,6 +677,8 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            if stream and self.api_type == "aws":
+                raise ValueError("Bedrock tool streaming is not supported by this adapter")
             # Validate tool_choice
             if tool_choice not in TOOL_CHOICE_VALUES:
                 raise ValueError(f"Invalid tool_choice: {tool_choice}")
@@ -728,23 +734,14 @@ class LLM:
                     temperature if temperature is not None else self.temperature
                 )
 
-            params["stream"] = False  # Always use non-streaming for tool requests
-            response: ChatCompletion = await self.client.chat.completions.create(
-                **params
+            params["stream"] = stream
+            if stream:
+                params["stream_options"] = {
+                    **params.get("stream_options", {}), "include_usage": True,
+                }
+            return await request_message(
+                self, params, input_tokens, tools=tools, on_event=on_event
             )
-
-            # Check if response is valid
-            if not response.choices or not response.choices[0].message:
-                print(response)
-                # raise ValueError("Invalid or empty response from LLM")
-                return None
-
-            # Update token counts
-            self.update_token_count(
-                response.usage.prompt_tokens, response.usage.completion_tokens
-            )
-
-            return response.choices[0].message
 
         except TokenLimitExceeded:
             # Re-raise token limit errors without logging

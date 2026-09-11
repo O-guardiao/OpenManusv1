@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 from enum import Enum
@@ -9,6 +10,7 @@ from app.agent.base import BaseAgent
 from app.flow.base import BaseFlow
 from app.llm import LLM
 from app.logger import logger
+from app.oak.runtime import OakRuntime
 from app.schema import AgentState, Message, ToolChoice
 from app.tool import PlanningTool
 
@@ -50,6 +52,8 @@ class PlanningFlow(BaseFlow):
     executor_keys: List[str] = Field(default_factory=list)
     active_plan_id: str = Field(default_factory=lambda: f"plan_{int(time.time())}")
     current_step_index: Optional[int] = None
+    oak_runtime: Optional[OakRuntime] = None
+    terminal_status: str = "not_started"
 
     def __init__(
         self, agents: Union[BaseAgent, List[BaseAgent], Dict[str, BaseAgent]], **data
@@ -73,6 +77,8 @@ class PlanningFlow(BaseFlow):
         # Set executor_keys to all agent keys if not specified
         if not self.executor_keys:
             self.executor_keys = list(self.agents.keys())
+        if self.oak_runtime is None and self.primary_agent is not None:
+            self.oak_runtime = getattr(self.primary_agent, "oak_runtime", None)
 
     def get_executor(self, step_type: Optional[str] = None) -> BaseAgent:
         """
@@ -93,12 +99,18 @@ class PlanningFlow(BaseFlow):
 
     async def execute(self, input_text: str) -> str:
         """Execute the planning flow with agents."""
+        owns_task = False
+        terminal_status = "failed"
+        self.terminal_status = "running"
         try:
             if not self.primary_agent:
                 raise ValueError("No primary agent available")
 
             # Create initial plan if input provided
             if input_text:
+                if self.oak_runtime and not self.oak_runtime.task_active:
+                    self.oak_runtime.begin_task(input_text)
+                    owns_task = True
                 await self._create_initial_plan(input_text)
 
                 # Verify plan was created successfully
@@ -106,6 +118,7 @@ class PlanningFlow(BaseFlow):
                     logger.error(
                         f"Plan creation failed. Plan ID {self.active_plan_id} not found in planning tool."
                     )
+                    terminal_status = "failed"
                     return f"Failed to create plan for: {input_text}"
 
             result = ""
@@ -115,6 +128,7 @@ class PlanningFlow(BaseFlow):
 
                 # Exit if no more steps or plan completed
                 if self.current_step_index is None:
+                    terminal_status = self._plan_terminal_status()
                     result += await self._finalize_plan()
                     break
 
@@ -131,7 +145,29 @@ class PlanningFlow(BaseFlow):
             return result
         except Exception as e:
             logger.error(f"Error in PlanningFlow: {str(e)}")
+            terminal_status = "failed"
             return f"Execution failed: {str(e)}"
+        finally:
+            self.terminal_status = terminal_status
+            if owns_task and self.oak_runtime:
+                self.oak_runtime.finish_task(terminal_status)
+
+    def _plan_terminal_status(self) -> str:
+        """Return a truthful terminal state from persisted step statuses."""
+
+        plan = self.planning_tool.plans.get(self.active_plan_id, {})
+        steps = plan.get("steps", [])
+        statuses = list(plan.get("step_statuses", []))
+        statuses.extend(
+            [PlanStepStatus.NOT_STARTED.value] * (len(steps) - len(statuses))
+        )
+        if any(status == PlanStepStatus.BLOCKED.value for status in statuses):
+            return "blocked"
+        if steps and all(
+            status == PlanStepStatus.COMPLETED.value for status in statuses
+        ):
+            return "completed"
+        return "incomplete"
 
     async def _create_initial_plan(self, request: str) -> None:
         """Create an initial plan based on the request using the flow's LLM and PlanningTool."""
@@ -182,10 +218,16 @@ class PlanningFlow(BaseFlow):
                     # Parse the arguments
                     args = tool_call.function.arguments
                     if isinstance(args, str):
+                        argument_digest = hashlib.sha256(
+                            args.encode("utf-8")
+                        ).hexdigest()
                         try:
                             args = json.loads(args)
                         except json.JSONDecodeError:
-                            logger.error(f"Failed to parse tool arguments: {args}")
+                            logger.error(
+                                "Failed to parse planning tool arguments "
+                                f"({argument_digest})"
+                            )
                             continue
 
                     # Ensure plan_id is set correctly and execute the tool
@@ -194,7 +236,10 @@ class PlanningFlow(BaseFlow):
                     # Execute the tool via ToolCollection instead of directly
                     result = await self.planning_tool.execute(**args)
 
-                    logger.info(f"Plan creation result: {str(result)}")
+                    logger.info(
+                        f"Plan creation returned {len(str(result))} characters"
+                    )
+                    await self._apply_oak_plan_contract()
                     return
 
         # If execution reached here, create a default plan
@@ -209,6 +254,23 @@ class PlanningFlow(BaseFlow):
                 "steps": ["Analyze request", "Execute task", "Verify results"],
             }
         )
+        await self._apply_oak_plan_contract()
+
+    async def _apply_oak_plan_contract(self) -> None:
+        """Normalize model output through the frozen, evidence-aware controller."""
+
+        if self.oak_runtime is None:
+            return
+        plan = self.planning_tool.plans.get(self.active_plan_id)
+        if not plan:
+            return
+        normalized_steps = self.oak_runtime.normalize_plan(plan.get("steps", []))
+        if normalized_steps != plan.get("steps", []):
+            await self.planning_tool.execute(
+                command="update",
+                plan_id=self.active_plan_id,
+                steps=normalized_steps,
+            )
 
     async def _get_current_step_info(self) -> tuple[Optional[int], Optional[dict]]:
         """
@@ -293,18 +355,46 @@ class PlanningFlow(BaseFlow):
 
         # Use agent.run() to execute the step
         try:
+            evidence_before = (
+                self.oak_runtime.evidence_count if self.oak_runtime else 0
+            )
+            if self.oak_runtime:
+                self.oak_runtime.coordinate(executor.name, step_text)
             step_result = await executor.run(step_prompt)
 
-            # Mark the step as completed after successful execution
-            await self._mark_step_completed()
+            if self.oak_runtime:
+                assessment = self.oak_runtime.evaluate_step(
+                    step_result,
+                    evidence_before=evidence_before,
+                    requires_evidence=(
+                        "[verify]" in step_text.casefold()
+                        or any(
+                            word in step_text.casefold()
+                            for word in ("verify", "validate", "test", "evidence")
+                        )
+                    ),
+                )
+                await self._mark_current_step(
+                    assessment.status,
+                    assessment.reason,
+                )
+            else:
+                await self._mark_step_completed()
 
             return step_result
         except Exception as e:
             logger.error(f"Error executing step {self.current_step_index}: {e}")
+            await self._mark_current_step("blocked", type(e).__name__)
             return f"Error executing step {self.current_step_index}: {str(e)}"
 
     async def _mark_step_completed(self) -> None:
         """Mark the current step as completed."""
+        await self._mark_current_step(PlanStepStatus.COMPLETED.value)
+
+    async def _mark_current_step(
+        self, status: str, notes: Optional[str] = None
+    ) -> None:
+        """Persist a controller-assessed step state."""
         if self.current_step_index is None:
             return
 
@@ -314,10 +404,11 @@ class PlanningFlow(BaseFlow):
                 command="mark_step",
                 plan_id=self.active_plan_id,
                 step_index=self.current_step_index,
-                step_status=PlanStepStatus.COMPLETED.value,
+                step_status=status,
+                step_notes=notes,
             )
             logger.info(
-                f"Marked step {self.current_step_index} as completed in plan {self.active_plan_id}"
+                f"Marked step {self.current_step_index} as {status} in plan {self.active_plan_id}"
             )
         except Exception as e:
             logger.warning(f"Failed to update plan status: {e}")
@@ -331,8 +422,14 @@ class PlanningFlow(BaseFlow):
                     step_statuses.append(PlanStepStatus.NOT_STARTED.value)
 
                 # Update the status
-                step_statuses[self.current_step_index] = PlanStepStatus.COMPLETED.value
+                step_statuses[self.current_step_index] = status
                 plan_data["step_statuses"] = step_statuses
+                if notes:
+                    step_notes = plan_data.get("step_notes", [])
+                    while len(step_notes) <= self.current_step_index:
+                        step_notes.append("")
+                    step_notes[self.current_step_index] = notes
+                    plan_data["step_notes"] = step_notes
 
     async def _get_plan_text(self) -> str:
         """Get the current plan as formatted text."""
@@ -404,39 +501,8 @@ class PlanningFlow(BaseFlow):
             return f"Error: Unable to retrieve plan with ID {self.active_plan_id}"
 
     async def _finalize_plan(self) -> str:
-        """Finalize the plan and provide a summary using the flow's LLM directly."""
+        """Return the recorded plan without a hidden model rewrite."""
+
         plan_text = await self._get_plan_text()
-
-        # Create a summary using the flow's LLM directly
-        try:
-            system_message = Message.system_message(
-                "You are a planning assistant. Your task is to summarize the completed plan."
-            )
-
-            user_message = Message.user_message(
-                f"The plan has been completed. Here is the final plan status:\n\n{plan_text}\n\nPlease provide a summary of what was accomplished and any final thoughts."
-            )
-
-            response = await self.llm.ask(
-                messages=[user_message], system_msgs=[system_message]
-            )
-
-            return f"Plan completed:\n\n{response}"
-        except Exception as e:
-            logger.error(f"Error finalizing plan with LLM: {e}")
-
-            # Fallback to using an agent for the summary
-            try:
-                agent = self.primary_agent
-                summary_prompt = f"""
-                The plan has been completed. Here is the final plan status:
-
-                {plan_text}
-
-                Please provide a summary of what was accomplished and any final thoughts.
-                """
-                summary = await agent.run(summary_prompt)
-                return f"Plan completed:\n\n{summary}"
-            except Exception as e2:
-                logger.error(f"Error finalizing plan with agent: {e2}")
-                return "Plan completed. Error generating summary."
+        status = self._plan_terminal_status()
+        return f"Plan {status}:\n\n{plan_text}"

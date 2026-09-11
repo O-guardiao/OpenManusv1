@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "task": {
+    "name": "OpenManus intrinsic control kernel",
+    "description": "Typed capabilities, systemic design patterns, provenance, and source-to-sink controls for the OpenManus runtime."
+  },
+  "entity_types": [
+    {
+      "name": "ToolCapability",
+      "primary_key": "tool_name",
+      "properties": {
+        "tool_name": "string",
+        "description": "string",
+        "source": "boolean",
+        "sink": "boolean",
+        "trust_tier": "string",
+        "carrier_type": "string",
+        "requires_grant": "boolean",
+        "tainted_sink_requires_approval": "boolean",
+        "risk_score": "integer",
+        "patterns": "string_list"
+      }
+    },
+    {
+      "name": "DesignPattern",
+      "primary_key": "pattern_id",
+      "properties": {
+        "pattern_id": "string",
+        "name": "string",
+        "subsystem": "string",
+        "description": "string"
+      }
+    },
+    {
+      "name": "PaperMechanism",
+      "primary_key": "mechanism_id",
+      "properties": {
+        "mechanism_id": "string",
+        "paper": "string",
+        "description": "string",
+        "limitation": "string"
+      }
+    }
+  ],
+  "relations": [
+    {
+      "name": "capability_uses_pattern",
+      "source": "ToolCapability",
+      "target": "DesignPattern"
+    },
+    {
+      "name": "pattern_evidenced_by",
+      "source": "DesignPattern",
+      "target": "PaperMechanism"
+    }
+  ]
+}

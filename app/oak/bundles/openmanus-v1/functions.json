@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "functions": [
+    {
+      "name": "get_tool_profile",
+      "description": "Return the typed security and provenance profile for one declared tool.",
+      "inputs": {
+        "tool_name": {"type": "string", "required": true}
+      },
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "filter_categorical", "args": {"conditions": [{"property": "tool_name", "include": [{"value_from": "tool_name"}]}]}},
+        {"operator": "project_properties", "args": {"property_names": ["tool_name", "source", "sink", "trust_tier", "carrier_type", "requires_grant", "tainted_sink_requires_approval", "risk_score", "patterns"]}}
+      ]
+    },
+    {
+      "name": "patterns_for_tool",
+      "description": "Traverse from a tool capability to the patterns governing it.",
+      "inputs": {
+        "tool_name": {"type": "string", "required": true}
+      },
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "filter_categorical", "args": {"conditions": [{"property": "tool_name", "include": [{"value_from": "tool_name"}]}]}},
+        {"operator": "traverse_relations", "args": {"relation_types": ["capability_uses_pattern"], "direction": "outgoing", "max_hops": 1, "include_starting_entities": false}},
+        {"operator": "project_properties", "args": {"property_names": ["pattern_id", "name", "subsystem"]}}
+      ]
+    },
+    {
+      "name": "capabilities_at_or_above_risk",
+      "description": "Filter capabilities using a typed numeric risk threshold.",
+      "inputs": {
+        "minimum_risk": {"type": "integer", "required": true}
+      },
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "filter_numeric", "args": {"conditions": [{"property": "risk_score", "op": "gte", "value": {"value_from": "minimum_risk"}}]}},
+        {"operator": "project_properties", "args": {"property_names": ["tool_name", "risk_score", "source", "sink"]}}
+      ]
+    },
+    {
+      "name": "capabilities_using_patterns",
+      "description": "Select capabilities whose pattern set overlaps a requested set.",
+      "inputs": {
+        "patterns": {"type": "string_list", "required": true}
+      },
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "filter_set_overlap", "args": {"conditions": [{"property": "patterns", "values": {"value_from": "patterns"}, "mode": "any"}]}},
+        {"operator": "project_properties", "args": {"property_names": ["tool_name", "patterns", "risk_score"]}}
+      ]
+    },
+    {
+      "name": "source_tools",
+      "description": "List declared tools whose results introduce external taint.",
+      "inputs": {},
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "filter_categorical", "args": {"conditions": [{"property": "source", "include": [true]}]}},
+        {"operator": "project_properties", "args": {"property_names": ["tool_name", "carrier_type", "risk_score"]}}
+      ]
+    },
+    {
+      "name": "sensitive_sinks",
+      "description": "List declared tools capable of sensitive effects.",
+      "inputs": {},
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "filter_categorical", "args": {"conditions": [{"property": "sink", "include": [true]}]}},
+        {"operator": "project_properties", "args": {"property_names": ["tool_name", "tainted_sink_requires_approval", "risk_score"]}}
+      ]
+    },
+    {
+      "name": "patterns_connected_to_mechanism",
+      "description": "Select patterns connected to one paper mechanism.",
+      "inputs": {
+        "mechanism_entity_id": {"type": "string", "required": true}
+      },
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["DesignPattern"]}},
+        {"operator": "filter_relation_connected", "args": {"conditions": [{"relation_types": ["pattern_evidenced_by"], "anchor_entity_ids": [{"value_from": "mechanism_entity_id"}], "direction": "outgoing"}]}},
+        {"operator": "project_properties", "args": {"property_names": ["pattern_id", "name", "subsystem"]}}
+      ]
+    },
+    {
+      "name": "find_capabilities",
+      "description": "Retrieve capability entities by deterministic text similarity.",
+      "inputs": {
+        "query": {"type": "string", "required": true}
+      },
+      "output": {"type": "rows"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"], "text_query": {"value_from": "query"}, "min_score": 0.15, "top_k": 5}},
+        {"operator": "project_properties", "args": {"property_names": ["tool_name", "description", "risk_score"]}}
+      ]
+    },
+    {
+      "name": "count_capabilities",
+      "description": "Count the declared tool capability entities.",
+      "inputs": {},
+      "output": {"type": "aggregate"},
+      "pipeline": [
+        {"operator": "lookup_entities", "args": {"entity_types": ["ToolCapability"]}},
+        {"operator": "aggregate_values", "args": {"request": {"operation": "count"}}}
+      ]
+    },
+    {
+      "name": "bind_runtime_slots",
+      "description": "Declare the model-mediated extraction boundary; deterministic execution refuses it until evidenced values are bound.",
+      "inputs": {
+        "request": {"type": "string", "required": true}
+      },
+      "output": {"type": "json"},
+      "pipeline": [
+        {"operator": "extract_runtime_slots", "args": {"request": {"value_from": "request"}}}
+      ]
+    }
+  ]
+}

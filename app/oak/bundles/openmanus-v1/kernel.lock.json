@@ -1,0 +1,28 @@
+{
+  "assurance_level": "structural_only",
+  "bundle_sha256": "c24d7820182832d858216f96b706ec3c521aaf44058efe966940df72535365fc",
+  "counts": {
+    "entities": 29,
+    "entity_types": 3,
+    "functions": 10,
+    "relation_types": 2,
+    "relations": 39
+  },
+  "evidence_files": {
+    "graph.json": "c5505bcc1495fb28d88ed56072df4b7c35520f3a17cf38c7dcc36090b5413d02"
+  },
+  "evidence_sha256": "ced53b553207cdbc08885fd9f190ed69deb526f257007bdfa5becbf80ab53964",
+  "files": {
+    "functions.json": "d29678b7effebe12b73fbe071e421f36e57a9247d5050889f84a25a24163a777",
+    "graph.json": "c5505bcc1495fb28d88ed56072df4b7c35520f3a17cf38c7dcc36090b5413d02",
+    "schema.json": "a6c77d683ba8eb6c00a9cbf7a60176602ad44c82241c100c96bb8f13a6dab5d6"
+  },
+  "frozen_at": "2026-09-03T05:52:17.558558+00:00",
+  "kernel_files": {
+    "functions.json": "d29678b7effebe12b73fbe071e421f36e57a9247d5050889f84a25a24163a777",
+    "schema.json": "a6c77d683ba8eb6c00a9cbf7a60176602ad44c82241c100c96bb8f13a6dab5d6"
+  },
+  "kernel_sha256": "88590f6150803292d546e8b6ae43dce93d5d93303c24a95172f2f385fbf7481e",
+  "schema_version": 2,
+  "status": "frozen"
+}
